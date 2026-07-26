@@ -1,71 +1,105 @@
-from fastapi import FastAPI, HTTPException, status
-from pydantic import BaseModel
-from typing import Optional, List
+import sqlite3
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="Task API")
+app = FastAPI(title="Backend CRUD API with SQLite")
 
-# This defines what a "Task" data object must look like
-class Task(BaseModel):
-    id: int
-    title: str
-    done: bool
-tasks_db: List[Task] = [
-    Task(id=1, title="Learn FastAPI basics", done=True),
-    Task(id=2, title="Build a CRUD API", done=False),
-    Task(id=3, title="Push code to GitHub", done=False),
-]
-id_counter = 3 
-@app.get("/")
-def get_root():
-    return {"name": "Task API", "version": "1.0"}
-@app.get("/health")
-def get_health():
-    return {"status": "ok"}
+DB_FILE = "tasks.db"
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row  # Access columns by name
+    return conn
+
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Create tasks table if it doesn't exist
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            done BOOLEAN NOT NULL DEFAULT 0
+        )
+    """)
+    # Seed 3 tasks ONLY if the database table is completely empty
+    cursor.execute("SELECT COUNT(*) FROM tasks")
+    if cursor.fetchone()[0] == 0:
+        initial_tasks = [
+            ("Learn FastAPI Basics", 1),
+            ("Connect SQLite Database", 0),
+            ("Submit BE-02 Assignment", 0)
+        ]
+        cursor.executemany("INSERT INTO tasks (title, done) VALUES (?, ?)", initial_tasks)
+    conn.commit()
+    conn.close()
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
+class TaskCreate(BaseModel):
+    title: str = Field(..., min_length=1)
+    done: bool = False
+
 @app.get("/tasks")
 def get_all_tasks():
-    return tasks_db
-@app.get("/tasks/{id}")
-def get_single_task(id: int):
-    for task in tasks_db:
-        if task.id == id:
-            return task
-    raise HTTPException(status_code=404, detail=f"Task {id} not found")
+    conn = get_db_connection()
+    tasks = conn.execute("SELECT * FROM tasks").fetchall()
+    conn.close()
+    return [dict(task) for task in tasks]
 
-class CreateTaskPayload(BaseModel):
-    title: str
+@app.get("/tasks/{task_id}")
+def get_single_task(task_id: int):
+    conn = get_db_connection()
+    task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    conn.close()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return dict(task)
 
 @app.post("/tasks", status_code=201)
-def create_task(payload: CreateTaskPayload):
-    global id_counter
-    # Validation: If the user provides an empty string or spaces, error out
-    if not payload.title.strip():
-        raise HTTPException(status_code=400, detail="Title cannot be empty")
-        
-    id_counter += 1
-    new_task = Task(id=id_counter, title=payload.title, done=False)
-    tasks_db.append(new_task)
-    return new_task
-class UpdateTaskPayload(BaseModel):
-    title: Optional[str] = None
-    done: Optional[bool] = None
+def create_task(task: TaskCreate):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO tasks (title, done) VALUES (?, ?)",
+        (task.title, 1 if task.done else 0)
+    )
+    conn.commit()
+    new_id = cursor.lastrowid
+    new_task = conn.execute("SELECT * FROM tasks WHERE id = ?", (new_id,)).fetchone()
+    conn.close()
+    return dict(new_task)
 
-@app.put("/tasks/{id}")
-def update_task(id: int, payload: UpdateTaskPayload):
-    for task in tasks_db:
-        if task.id == id:
-            if payload.title is not None:
-                if not payload.title.strip():
-                    raise HTTPException(status_code=400, detail="Title cannot be empty")
-                task.title = payload.title
-            if payload.done is not None:
-                task.done = payload.done
-            return task
-    raise HTTPException(status_code=404, detail=f"Task {id} not found")
-@app.delete("/tasks/{id}", status_code=204)
-def delete_task(id: int):
-    global tasks_db
-    for index, task in enumerate(tasks_db):
-        if task.id == id:
-            tasks_db.pop(index)
-            return 
-    raise HTTPException(status_code=404, detail=f"Task {id} not found")
+@app.put("/tasks/{task_id}")
+def update_task(task_id: int, task: TaskCreate):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    existing = cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    cursor.execute(
+        "UPDATE tasks SET title = ?, done = ? WHERE id = ?",
+        (task.title, 1 if task.done else 0, task_id)
+    )
+    conn.commit()
+    updated_task = cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    conn.close()
+    return dict(updated_task)
+
+@app.delete("/tasks/{task_id}", status_code=204)
+def delete_task(task_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    existing = cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not existing:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+    return None
